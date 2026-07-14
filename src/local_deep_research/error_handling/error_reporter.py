@@ -332,10 +332,20 @@ class ErrorReporter:
                 return
 
             # Send notification
-            notification_manager.send_notification(
+            result = notification_manager.send_notification(
                 event_type=event_type,
                 context=notification_context,
             )
+            if not result:
+                # DEBUG so it doesn't pollute the default log, but operators
+                # enabling ``--log-level debug`` can see precisely why the
+                # error-notification didn't fire (e.g. server_disabled vs.
+                # unconfigured). See issue #4877.
+                logger.debug(
+                    "Error notification not sent: {}",
+                    getattr(result, "reason", None)
+                    or ("dropped" if not bool(result) else "sent"),
+                )
 
         except Exception as e:
             logger.debug(f"Failed to send error notification: {e}")
