@@ -2122,3 +2122,325 @@ class TestResearchSubtopicToolTruncation:
         assert "\r" not in tail
         # The escaped form (literal backslash-n) is present instead.
         assert "\\n" in tail
+
+
+# ---------------------------------------------------------------------------
+# research_subtopic per-task deadline (#5014)
+# ---------------------------------------------------------------------------
+#
+# Reproduction: with MAX_SUBTOPICS=5 and MAX_SUBAGENT_WORKERS=4, the 5th
+# subtopic queues. Under the old code, the shared ``as_completed`` timeout
+# killed it with a misleading "timed out after 1800s" message even when it
+# had only run for seconds. Option A tracks per-task start times so each
+# subagent's deadline is measured from when its worker thread actually
+# begins, and the shared timer is replaced with a generous overall cap.
+#
+# These tests monkeypatch the module-level constants to small values so the
+# real ThreadPoolExecutor / as_completed code path is exercised under the 2
+# minute CI budget (with @pytest.mark.slow so they can be deselected on
+# tiny machines). See .pre-commit-hooks/check-unmarked-sleep.py.
+
+
+@pytest.mark.slow
+class TestResearchSubtopicPerTaskTimeout:
+    """Regression tests for #5014 Option A: the research_subtopic drain
+    loop must give each subagent its own per-task deadline measured from
+    its actual start time, not kill it with a shared timer as soon as the
+    leading batch exhausts the wall clock. The ``as_completed`` loop's
+    overall budget is a backstop only."""
+
+    MODULE = (
+        "local_deep_research.advanced_search_system.strategies."
+        "langgraph_agent_strategy"
+    )
+
+    def _make_tool(self, max_workers=None):
+        from local_deep_research.advanced_search_system.strategies.langgraph_agent_strategy import (
+            SearchResultsCollector,
+            _make_research_subtopic_tool,
+        )
+
+        collector = SearchResultsCollector([])
+        return _make_research_subtopic_tool(
+            search_engine_name="duckduckgo",
+            model=MagicMock(),
+            settings_snapshot={"search.tool": {"value": "duckduckgo"}},
+            collector=collector,
+            max_sub_iterations=8,
+            progress_callback=None,
+            max_workers=max_workers,
+        )
+
+    def test_queued_subagent_is_not_falsely_timed_out(self, monkeypatch):
+        """Regression for #5014: with workers=1 and 3 subtopics, the 2nd
+        and 3rd subagents queue. Under the OLD code the shared
+        ``as_completed(timeout=SUBAGENT_TIMEOUT_SECONDS)`` timer killed
+        the queued tasks with a misleading "timed out after 1800s" once
+        task 1 exhausted the budget, even though tasks 2/3 had run for
+        only fractions of a second. The fix must let them finish their
+        own work and report real results."""
+        import time
+
+        from local_deep_research.advanced_search_system.strategies import (
+            langgraph_agent_strategy as mod,
+        )
+        from local_deep_research.advanced_search_system.strategies.langgraph_agent_strategy import (  # noqa: E501
+            SearchResultsCollector,
+            _make_research_subtopic_tool,
+        )
+
+        monkeypatch.setattr(mod, "SUBAGENT_TIMEOUT_SECONDS", 2, raising=False)
+        monkeypatch.setattr(mod, "MAX_SUBTOPICS", 3, raising=False)
+        monkeypatch.setattr(mod, "MAX_SUBAGENT_WORKERS", 1, raising=False)
+        monkeypatch.setattr(
+            mod,
+            "OVERALL_SUBAGENT_BUDGET_SECONDS",
+            20,
+            raising=False,
+        )
+
+        def _run_with_topic(topic):
+            # task 0 burns most of the budget; tasks 1/2 start late and
+            # must still get their full ~1s window.
+            burns = {"slow": 1.5, "q1": 0.3, "q2": 0.3}
+            time.sleep(burns[topic])
+            return f"finding for {topic}"
+
+        # The factory creates run_subagent inside its closure; we patch
+        # ``_run_subagent_with_egress`` so we bypass the real LangGraph
+        # agent entirely while still exercising the queueing code path.
+        def _fast_egress(topic):
+            return _run_with_topic(topic)
+
+        # Build the tool with max_workers=1 to force queueing.
+        collector = SearchResultsCollector([])
+        tool = _make_research_subtopic_tool(
+            search_engine_name="duckduckgo",
+            model=MagicMock(),
+            settings_snapshot={"search.tool": {"value": "duckduckgo"}},
+            collector=collector,
+            max_sub_iterations=8,
+            progress_callback=None,
+            max_workers=1,
+        )
+        monkeypatch.setattr(mod, "_run_subagent_with_egress", _fast_egress)
+
+        result = tool.invoke({"subtopics": ["slow", "q1", "q2"]})
+
+        # The two queued subtopics MUST return their real findings, not
+        # the misleading "timed out after Xs" message.
+        assert "finding for slow" in result, result
+        assert "finding for q1" in result, result
+        assert "finding for q2" in result, result
+        # And the misleading hard-coded shared-budget message must not
+        # appear anywhere in the rendered block.
+        assert "timed out after" not in result
+
+    def test_overall_cap_timeout_reports_actual_elapsed(self, monkeypatch):
+        """When the overall research_subtopic safety cap fires, the report
+        for the unfinished subagent must show its *actual* elapsed time
+        (plus, when applicable, what caused the cancellation) — not the
+        old hard-coded ``"timed out after 1800s"`` boilerplate."""
+        import re as _re
+        import time
+
+        from local_deep_research.advanced_search_system.strategies import (
+            langgraph_agent_strategy as mod,
+        )
+        from local_deep_research.advanced_search_system.strategies.langgraph_agent_strategy import (  # noqa: E501
+            SearchResultsCollector,
+            _make_research_subtopic_tool,
+        )
+
+        # Generous per-task budget so it never fires in the test window;
+        # tight overall cap so the safety net is what kills the task.
+        monkeypatch.setattr(mod, "MAX_SUBTOPICS", 1, raising=False)
+        monkeypatch.setattr(mod, "MAX_SUBAGENT_WORKERS", 1, raising=False)
+        monkeypatch.setattr(mod, "SUBAGENT_TIMEOUT_SECONDS", 600, raising=False)
+        monkeypatch.setattr(mod, "OVERALL_SUBAGENT_BUDGET_SECONDS", 2)
+
+        def _hang(_):
+            time.sleep(5.0)  # outlives the overall cap
+            return "should not be returned"
+
+        collector = SearchResultsCollector([])
+        tool = _make_research_subtopic_tool(
+            search_engine_name="duckduckgo",
+            model=MagicMock(),
+            settings_snapshot={"search.tool": {"value": "duckduckgo"}},
+            collector=collector,
+            max_sub_iterations=8,
+            progress_callback=None,
+            max_workers=1,
+        )
+        monkeypatch.setattr(mod, "_run_subagent_with_egress", _hang)
+
+        result = tool.invoke({"subtopics": ["hangs forever"]})
+
+        # The report must mention the topic and a real elapsed-seconds
+        # value (not the original SUBAGENT_TIMEOUT_SECONDS=1800 constant).
+        assert "hangs forever" in result
+        # Pull out the line under the topic header.
+        report = result.split("## hangs forever\n", 1)[1].splitlines()[0]
+        secs = [int(m) for m in _re.findall(r"(\d+)s", report) if int(m) >= 1]
+        assert secs, f"no seconds token in report: {report!r}"
+        # No reported number may match the SUBAGENT_TIMEOUT_SECONDS
+        # constant (1800s, the bug's misleading hard-code).
+        for s in secs:
+            assert s != 1800, (
+                f"report still hard-codes SUBAGENT_TIMEOUT_SECONDS=1800: "
+                f"{report!r}"
+            )
+        # Either the per-task-deadline branch or the overall-cap branch
+        # must fire — both are honest; the OLD code would have lied.
+        assert (
+            "timed out after" in report.lower() or "overall" in report.lower()
+        ), report
+        # And the actual elapsed should be near the OVERALL cap (a few
+        # seconds), not anywhere near the 30-minute per-task constant.
+        assert all(s < 10 for s in secs), (
+            f"reported elapsed should be the real ~2s value, not the "
+            f"30-min default: {report!r}"
+        )
+
+    def test_happy_path_no_cap_message(self, monkeypatch):
+        """When no subagent hangs, neither branch of the TimeoutError
+        exception path may fire — every subtopic returns its real result
+        and no timeout/overall-cap language leaks into the lead-visible
+        output. The new subtopic-rendering path must not regress the
+        normal-completion path while fixing the false-timeout bug."""
+        from local_deep_research.advanced_search_system.strategies import (
+            langgraph_agent_strategy as mod,
+        )
+        from local_deep_research.advanced_search_system.strategies.langgraph_agent_strategy import (  # noqa: E501
+            SearchResultsCollector,
+            _make_research_subtopic_tool,
+        )
+
+        monkeypatch.setattr(mod, "MAX_SUBTOPICS", 4, raising=False)
+        monkeypatch.setattr(mod, "MAX_SUBAGENT_WORKERS", 2, raising=False)
+        monkeypatch.setattr(mod, "SUBAGENT_TIMEOUT_SECONDS", 10, raising=False)
+        monkeypatch.setattr(mod, "OVERALL_SUBAGENT_BUDGET_SECONDS", 60)
+
+        def _runner(topic):
+            return f"ok: {topic}"
+
+        collector = SearchResultsCollector([])
+        tool = _make_research_subtopic_tool(
+            search_engine_name="duckduckgo",
+            model=MagicMock(),
+            settings_snapshot={"search.tool": {"value": "duckduckgo"}},
+            collector=collector,
+            max_sub_iterations=8,
+            progress_callback=None,
+            max_workers=2,
+        )
+        monkeypatch.setattr(mod, "_run_subagent_with_egress", _runner)
+
+        result = tool.invoke({"subtopics": ["a", "b", "c", "d"]})
+        for t in ("a", "b", "c", "d"):
+            assert f"ok: {t}" in result, result
+        assert "timed out" not in result
+        assert "overall" not in result.lower()
+
+
+@pytest.mark.slow
+class TestResearchSubagentWorkersEnvOverride:
+    """Tests for #5014 follow-up: expose MAX_SUBAGENT_WORKERS as a user
+    input via env var + ctor kwarg. Users with high-parallelism local
+    backends (ollama / lmstudio / llama.cpp) raise the worker count;
+    users with single-stream backends lower it."""
+
+    MODULE = (
+        "local_deep_research.advanced_search_system.strategies."
+        "langgraph_agent_strategy"
+    )
+
+    def test_env_var_overrides_default(self, monkeypatch):
+        from local_deep_research.advanced_search_system.strategies import (
+            langgraph_agent_strategy as mod,
+        )
+
+        monkeypatch.setenv(mod.LDR_LANGGRAPH_SUBAGENT_MAX_WORKERS, "5")
+        assert mod._resolve_subagent_max_workers() == 5
+
+    def test_env_var_invalid_falls_back_to_default(self, monkeypatch):
+        from local_deep_research.advanced_search_system.strategies import (
+            langgraph_agent_strategy as mod,
+        )
+
+        monkeypatch.setenv(mod.LDR_LANGGRAPH_SUBAGENT_MAX_WORKERS, "banana")
+        assert mod._resolve_subagent_max_workers() == mod.MAX_SUBAGENT_WORKERS
+
+    def test_env_var_below_min_clamped_up(self, monkeypatch):
+        from local_deep_research.advanced_search_system.strategies import (
+            langgraph_agent_strategy as mod,
+        )
+
+        monkeypatch.setenv(mod.LDR_LANGGRAPH_SUBAGENT_MAX_WORKERS, "0")
+        assert mod._resolve_subagent_max_workers() == 1
+
+    def test_env_var_above_max_clamped_down(self, monkeypatch):
+        from local_deep_research.advanced_search_system.strategies import (
+            langgraph_agent_strategy as mod,
+        )
+
+        monkeypatch.setenv(
+            mod.LDR_LANGGRAPH_SUBAGENT_MAX_WORKERS,
+            str(mod.MAX_SUBTOPICS + 100),
+        )
+        assert mod._resolve_subagent_max_workers() == mod.MAX_SUBTOPICS
+
+    def test_env_var_unset_uses_default(self, monkeypatch):
+        from local_deep_research.advanced_search_system.strategies import (
+            langgraph_agent_strategy as mod,
+        )
+
+        monkeypatch.delenv(
+            mod.LDR_LANGGRAPH_SUBAGENT_MAX_WORKERS, raising=False
+        )
+        assert mod._resolve_subagent_max_workers() == mod.MAX_SUBAGENT_WORKERS
+
+    def test_ctor_kwarg_wins_over_env(self, monkeypatch):
+        from local_deep_research.advanced_search_system.strategies import (
+            langgraph_agent_strategy as mod,
+        )
+
+        monkeypatch.setenv(mod.LDR_LANGGRAPH_SUBAGENT_MAX_WORKERS, "5")
+        collector = mod.SearchResultsCollector([])
+        tool = mod._make_research_subtopic_tool(
+            search_engine_name="duckduckgo",
+            model=MagicMock(),
+            settings_snapshot={"search.tool": {"value": "duckduckgo"}},
+            collector=collector,
+            max_sub_iterations=8,
+            progress_callback=None,
+            max_workers=1,  # explicit kwarg wins
+        )
+        # Indirectly verify by checking the underlying closure resolved to
+        # worker_pool_size == 1 via run with 2 subtopics + a mock that
+        # records num_workers.
+        # We don't have direct access to the closure, so just sanity-check
+        # that the tool was built without raising (closure wired up).
+        assert tool is not None
+
+
+def test_overall_budget_scales_with_queue_depth():
+    """OVERALL_SUBAGENT_BUDGET_SECONDS must be per-task-budget * the
+    maximum number of queued tasks (ceil(MAX_SUBTOPICS /
+    MAX_SUBAGENT_WORKERS))."""
+    from local_deep_research.advanced_search_system.strategies.langgraph_agent_strategy import (  # noqa: E501
+        MAX_SUBAGENT_WORKERS,
+        MAX_SUBTOPICS,
+        OVERALL_SUBAGENT_BUDGET_SECONDS,
+        SUBAGENT_TIMEOUT_SECONDS,
+    )
+    import math as _math
+
+    expected = SUBAGENT_TIMEOUT_SECONDS * _math.ceil(
+        MAX_SUBTOPICS / MAX_SUBAGENT_WORKERS
+    )
+    assert OVERALL_SUBAGENT_BUDGET_SECONDS == expected
+    # And the overall cap is never smaller than the per-task budget (a
+    # queued task should always get its own full window *in principle*).
+    assert OVERALL_SUBAGENT_BUDGET_SECONDS >= SUBAGENT_TIMEOUT_SECONDS

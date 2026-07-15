@@ -8,7 +8,9 @@ questions can be decomposed into subtopics researched in parallel by subagents.
 
 from __future__ import annotations
 
+import math
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 from datetime import UTC, datetime
 from typing import Any, Dict
@@ -21,6 +23,7 @@ from loguru import logger
 
 from ...citation_handler import CitationHandler
 from ...security import sanitize_error_for_client
+from ...settings.env_registry import get_env_setting
 from ...utilities.thread_context import get_search_context, search_context
 from ..tools.fetch import FETCH_MODES, build_fetch_tool
 from .base_strategy import BaseSearchStrategy
@@ -39,8 +42,69 @@ MAX_SUBTOPICS = 5  # must match the "pass 2-5" contract in the lead prompt
 # at the call site, with the dropped subtopics named in the tool's reply
 # so the lead agent can re-issue or avoid citing them.
 MAX_SUBAGENT_WORKERS = 4
+
+# Environment knob (#5014 follow-up): users with self-hosted backends
+# (ollama / lmstudio / llama.cpp) configure their own per-backend max
+# parallel requests, so we expose this for tuning. Restart-required.
+# Read via SettingsManager (``get_env_setting``) per the project's
+# env-var convention; raw ``os.environ`` access is forbidden outside
+# ``settings/``/``tests/`` by check-env-vars.py.
+LDR_LANGGRAPH_SUBAGENT_MAX_WORKERS = "LDR_LANGGRAPH_AGENT_SUBAGENT_MAX_WORKERS"
+_SUBAGENT_WORKERS_ENV_KEY = "langgraph_agent.subagent_max_workers"
+_SUBAGENT_WORKERS_ENV_MIN = 1
+_SUBAGENT_WORKERS_ENV_MAX = MAX_SUBTOPICS
+
+
+def _resolve_subagent_max_workers() -> int:
+    """Resolve the active subagent worker-pool size.
+
+    Priority:
+      1. ``LDR_LANGGRAPH_AGENT_SUBAGENT_MAX_WORKERS`` (integer env var).
+      2. ``MAX_SUBAGENT_WORKERS`` (compile-time default).
+
+    Invalid or out-of-range values are clamped (or fell back to the
+    default) with a one-shot warning so a typo never crashes the agent.
+    """
+    raw = get_env_setting(_SUBAGENT_WORKERS_ENV_KEY, default=None)
+    if raw is None or raw == "":
+        return MAX_SUBAGENT_WORKERS
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "{}={!r} is not an integer; falling back to default {}",
+            LDR_LANGGRAPH_SUBAGENT_MAX_WORKERS,
+            raw,
+            MAX_SUBAGENT_WORKERS,
+        )
+        return MAX_SUBAGENT_WORKERS
+    if parsed < _SUBAGENT_WORKERS_ENV_MIN or parsed > _SUBAGENT_WORKERS_ENV_MAX:
+        logger.warning(
+            "{}={} outside [{}, {}]; clamping",
+            LDR_LANGGRAPH_SUBAGENT_MAX_WORKERS,
+            parsed,
+            _SUBAGENT_WORKERS_ENV_MIN,
+            _SUBAGENT_WORKERS_ENV_MAX,
+        )
+        return max(
+            _SUBAGENT_WORKERS_ENV_MIN,
+            min(_SUBAGENT_WORKERS_ENV_MAX, parsed),
+        )
+    return parsed
+
+
 # CONTENT_FETCH_TIMEOUT and CONTENT_MAX_LENGTH live alongside the fetch
 # tool builders in advanced_search_system/tools/fetch/.
+
+# Overall wall-clock safety cap for the ``research_subtopic`` fan-out
+# (#5014 Option A).  When ``MAX_SUBTOPICS > MAX_SUBAGENT_WORKERS`` the
+# surplus subtopics queue, so the *aggregate* time the lead can be
+# blocked is roughly per-task-budget * queued-tasks.  This ceiling only
+# triggers for genuinely hung workers; individual tasks that finish
+# under their own ``SUBAGENT_TIMEOUT_SECONDS`` are reported normally.
+OVERALL_SUBAGENT_BUDGET_SECONDS = SUBAGENT_TIMEOUT_SECONDS * math.ceil(
+    MAX_SUBTOPICS / MAX_SUBAGENT_WORKERS
+)
 
 # Cap for credential-scrubbed tool/agent error strings. Larger than the
 # 200-char HTTP-client default of ``sanitize_error_for_client`` because these
@@ -331,6 +395,7 @@ def _make_research_subtopic_tool(
     fetch_mode: str = "summary_focus_query",
     overall_query: str = "",
     egress_context=None,
+    max_workers: int | None = None,
 ):
     """Create the ``research_subtopic`` tool that spawns parallel subagents.
 
@@ -470,41 +535,106 @@ def _make_research_subtopic_tool(
                 return run_subagent(topic)
 
         ordered_results: dict[str, str] = {}
-        num_workers = min(MAX_SUBAGENT_WORKERS, len(subtopics))
+        # Resolve worker-pool size: explicit ``max_workers`` arg (strategy
+        # constructor / tests) wins, then env, then default. Use a separate
+        # local so ruff doesn't flag the "referenced before assignment"
+        # pattern (F823) — we want the env fallback even when the arg is None.
+        worker_pool_size = (
+            max_workers
+            if max_workers is not None
+            else _resolve_subagent_max_workers()
+        )
+        num_workers = min(worker_pool_size, len(subtopics))
+
+        # Per-subagent start timestamps (#5014 Option A). The previous
+        # implementation used ``as_completed(timeout=SUBAGENT_TIMEOUT_SECONDS)``
+        # which is a *single* budget shared across the whole drain, so any
+        # queued subagent started late could be falsely killed by the shared
+        # timer. We now give each task its own deadline measured from when its
+        # worker thread actually begins, and use a separate, generous overall
+        # wall-clock cap (OVERALL_SUBAGENT_BUDGET_SECONDS) only as a hang
+        # backstop. dict mutations are guarded by a lock so workers and the
+        # main thread can read/write concurrently without UB on the GIL.
+        task_starts: dict[str, float] = {}
+        task_starts_lock = threading.Lock()
+
+        def _run_subagent_recording_start(topic: str) -> str:
+            with task_starts_lock:
+                task_starts[topic] = time.monotonic()
+            return _run_subagent_with_egress(topic)
+
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = {
-                executor.submit(_run_subagent_with_egress, t): t
+                executor.submit(_run_subagent_recording_start, t): t
                 for t in subtopics
             }
             try:
                 for future in as_completed(
-                    futures, timeout=SUBAGENT_TIMEOUT_SECONDS
+                    futures, timeout=OVERALL_SUBAGENT_BUDGET_SECONDS
                 ):
                     topic = futures[future]
                     try:
-                        ordered_results[topic] = future.result(
-                            timeout=SUBAGENT_TIMEOUT_SECONDS
-                        )
-                    except TimeoutError:
-                        logger.warning(f"Subagent timed out for: {topic[:80]}")
-                        ordered_results[topic] = (
-                            f"Research on '{topic}' timed out."
-                        )
+                        ordered_results[topic] = future.result()
                     except Exception as exc:
                         logger.exception(f"Subagent failed for: {topic[:80]}")
                         ordered_results[topic] = _scrub_tool_error(
                             f"Research on '{topic}' failed: {exc}"
                         )
             except TimeoutError:
-                # as_completed itself timed out — some futures didn't finish
+                # Overall wall-clock cap reached. For each unfinished
+                # future, distinguish a *real* per-task timeout (the
+                # subagent exceeded its own SUBAGENT_TIMEOUT_SECONDS) from
+                # an overall-cap kill so the lead never sees a misleading
+                # "timed out after 1800s" for a task that only ran for
+                # seconds. Real ThreadPoolExecutor worker threads can't be
+                # interrupted mid-call; ``future.cancel()`` is best-effort
+                # and returns False for tasks already running — we simply
+                # stop waiting on them, the future's worker reclaims the
+                # slot when the underlying call eventually returns.
+                now = time.monotonic()
                 for future, topic in futures.items():
-                    if topic not in ordered_results:
+                    if topic in ordered_results:
+                        continue
+                    with task_starts_lock:
+                        start = task_starts.get(topic)
+                    future.cancel()
+                    if start is None:
+                        # Worker never reached this task inside the cap.
                         logger.warning(
-                            f"Subagent timed out (overall): {topic[:80]}"
+                            "Subagent never started before overall cap: {:80}",
+                            topic,
+                        )
+                        ordered_results[topic] = (
+                            f"Research on '{topic}' did not start within "
+                            f"the overall budget "
+                            f"({OVERALL_SUBAGENT_BUDGET_SECONDS}s) and was "
+                            "cancelled."
+                        )
+                        continue
+                    elapsed = now - start
+                    if elapsed >= SUBAGENT_TIMEOUT_SECONDS:
+                        logger.warning(
+                            "Subagent timed out after {:.1f}s: {:80}",
+                            elapsed,
+                            topic,
                         )
                         ordered_results[topic] = (
                             f"Research on '{topic}' timed out after "
-                            f"{SUBAGENT_TIMEOUT_SECONDS}s."
+                            f"{int(elapsed)}s."
+                        )
+                    else:
+                        logger.warning(
+                            "Subagent cancelled by overall cap after "
+                            "{:.1f}s of running: {:80}",
+                            elapsed,
+                            topic,
+                        )
+                        ordered_results[topic] = (
+                            f"Research on '{topic}' was cancelled by the "
+                            f"overall research_subtopic budget "
+                            f"({OVERALL_SUBAGENT_BUDGET_SECONDS}s) after "
+                            f"running for {int(elapsed)}s; it had not yet "
+                            "exhausted its own per-subagent budget."
                         )
 
         # Return results in original order
@@ -553,6 +683,7 @@ class LangGraphAgentStrategy(BaseSearchStrategy):
         all_links_of_system: list | None = None,
         settings_snapshot: dict | None = None,
         programmatic_mode: bool = False,
+        max_subagent_workers: int | None = None,
         **kwargs,
     ):
         super().__init__(
@@ -577,6 +708,14 @@ class LangGraphAgentStrategy(BaseSearchStrategy):
         )
         self.max_sub_iterations = int(max_sub_iterations)
         self.include_sub_research = include_sub_research
+        # Subagent worker-pool size (#5014 follow-up). Resolved at
+        # tool-invocation time so process-level env changes are honoured
+        # without reconstructing the strategy.
+        self._max_subagent_workers = (
+            int(max_subagent_workers)
+            if max_subagent_workers is not None
+            else None
+        )
         self.citation_handler = citation_handler or CitationHandler(
             model,
             handler_type="standard",
@@ -954,6 +1093,7 @@ class LangGraphAgentStrategy(BaseSearchStrategy):
                     fetch_mode=self.fetch_mode,
                     overall_query=overall_query,
                     egress_context=policy_ctx,
+                    max_workers=self._max_subagent_workers,
                 )
             )
 

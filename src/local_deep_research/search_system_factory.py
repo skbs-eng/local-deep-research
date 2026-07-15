@@ -380,6 +380,11 @@ def create_strategy(
             programmatic_mode=kwargs.get("programmatic_mode", False),
             all_links_of_system=all_links_of_system,
             settings_snapshot=settings_snapshot,
+            # ``max_subagent_workers`` is read from
+            # ``LDR_LANGGRAPH_AGENT_SUBAGENT_MAX_WORKERS`` directly inside the
+            # strategy (env is the canonical user-input per #5014 follow-up).
+            # Tests/programmatic callers may still override via kwargs.
+            max_subagent_workers=kwargs.get("max_subagent_workers"),
         )
 
     # Default to source-based if unknown
