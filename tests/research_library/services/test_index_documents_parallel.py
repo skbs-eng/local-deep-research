@@ -521,7 +521,10 @@ class TestCancellation:
         assert "doc-1" not in indexed_docs
         # doc-1 result should show it was skipped due to cancellation
         assert result["results"]["doc-1"]["status"] == "skipped"
-        assert "Cancelled before submission" in result["results"]["doc-1"]["message"]
+        assert (
+            "Cancelled before submission"
+            in result["results"]["doc-1"]["message"]
+        )
 
 
 class TestWorkerBounds:
