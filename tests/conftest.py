@@ -305,6 +305,13 @@ def app(temp_data_dir, monkeypatch):
     # MIN_KDF_ITERATIONS_TESTING=1 specifically to support this.
     monkeypatch.setenv("LDR_DB_CONFIG_KDF_ITERATIONS", "1000")
 
+    # Match CI: HTTP rate limiting is disabled in every test that uses this
+    # fixture. The registration cap (3/hour/IP by default) is meaningless
+    # when 78+ tests each register a fresh user, and the auth rate-limit
+    # suite opts back in via its own ``app`` fixture. Keeping the same env
+    # var CI exports means tests behave identically locally and in CI.
+    monkeypatch.setenv("LDR_DISABLE_RATE_LIMITING", "true")
+
     # Note: PYTEST_CURRENT_TEST is automatically set by pytest, which
     # app_factory.py checks to disable secure cookies for testing
 
@@ -348,6 +355,7 @@ def app_with_csrf(temp_data_dir, monkeypatch):
     """
     monkeypatch.setenv("LDR_DATA_DIR", str(temp_data_dir))
     monkeypatch.setenv("LDR_DB_CONFIG_KDF_ITERATIONS", "1000")
+    monkeypatch.setenv("LDR_DISABLE_RATE_LIMITING", "true")
     app, _ = create_app()
     app.config["TESTING"] = True
     # Deliberately do NOT disable CSRF — this fixture exists to verify it.
@@ -396,10 +404,36 @@ def authenticated_client(app, temp_data_dir):
         )
 
         if register_response.status_code not in [200, 302]:
-            raise Exception(
-                f"Registration failed with status {register_response.status_code}: "
-                f"{register_response.data.decode()[:500]}"
-            )
+            # The first attempt can race with the previous test's SQLite
+            # WAL/SHM file-handle release on Windows: the route's exception
+            # handler returns the rendered register template as a 500 and
+            # the next attempt is usually clean. Rate limiting is disabled
+            # by the ``app`` fixture (matching CI) so the retry isn't
+            # capped at 3 attempts/hour; cap it at 5 here to stay safe if
+            # the env var ever falls back to the production default.
+            import time
+
+            register_response = None
+            for _attempt in range(5):
+                time.sleep(0.05 * (2**_attempt))
+                retry = client.post(
+                    "/auth/register",
+                    data={
+                        "username": test_username,
+                        "password": test_password,
+                        "confirm_password": test_password,
+                        "acknowledge": "true",
+                    },
+                    follow_redirects=False,
+                )
+                if retry.status_code in [200, 302]:
+                    register_response = retry
+                    break
+            if register_response is None:
+                raise Exception(
+                    f"Registration failed with status {retry.status_code} "
+                    f"after 5 retries: {retry.data.decode()[:500]}"
+                )
 
         # Login user
         login_response = client.post(

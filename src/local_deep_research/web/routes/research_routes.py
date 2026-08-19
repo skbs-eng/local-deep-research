@@ -1859,15 +1859,26 @@ def get_research_logs(research_id):
     clamped to ``[1, HISTORY_LOGS_HARD_CAP]`` so a client cannot force an
     unbounded load — a long langgraph run can persist thousands of rows. When
     ``?limit`` is absent or not a valid integer (Flask ``type=int`` yields
-    ``None``) the historical contract is preserved: every row is returned. The
-    frontend log panel always sends a valid limit and
-    ``priority=diagnostic``. That mode does a best-effort newest-first
-    selection prioritizing errors/CRITICAL/FATAL, then warnings, then
-    milestones/SUCCESS, before filling the remaining window with routine rows.
-    If the number of higher-priority rows exceeds the limit, the oldest
-    diagnostics in those categories and all lower-priority/routine rows are
-    dropped.
-    Direct API callers retain newest-N behavior unless they opt in.
+    ``None``) the historical contract is preserved: every row is returned.
+
+    The response contains ALL log levels (info / milestone / warning / error).
+    The frontend log panel routes the response into two views on the client
+    side: info+milestone rows feed the paginated, oldest-first display,
+    and warning+error rows are ignored here in favor of a separate fetch
+    against ``/api/research/<id>/logs/warnings-errors`` (the warnings/errors
+    list is too important to be paginated out of the live window). This
+    endpoint is structurally identical to the priority-free ``/logs/all``
+    endpoint; the live vs. non-live split is purely a frontend concern now.
+
+    Pagination is done with ``?before_id=X`` (return rows whose primary key
+    is strictly less than ``X``) and ``?after_id=Y`` (return rows whose primary
+    key is strictly greater than ``Y``). These are the recommended cursors
+    for the log panel: they are stable under live inserts (new rows have higher
+    IDs and don't shift the cursor) and use an index seek instead of a row-skip
+    on the SQL side. Combine with ``?limit=N`` to page in batches. ``before_id``
+    and ``after_id`` are mutually exclusive — requesting both returns 400
+    because the SQL planner can't combine the two index seeks into a single
+    ordered slice.
 
     ``jsonify`` serializes each ``timestamp`` datetime using Flask's RFC 822
     HTTP-date representation. The streaming ``/logs/export`` endpoint uses
@@ -1879,7 +1890,16 @@ def get_research_logs(research_id):
     limit = request.args.get("limit", type=int)
     if limit is not None:
         limit = max(1, min(limit, HISTORY_LOGS_HARD_CAP))
-    prioritize_diagnostics = request.args.get("priority") == "diagnostic"
+    before_id = request.args.get("before_id", type=int)
+    if before_id is not None and before_id <= 0:
+        before_id = None
+    after_id = request.args.get("after_id", type=int)
+    if after_id is not None and after_id <= 0:
+        after_id = None
+    if before_id is not None and after_id is not None:
+        return jsonify(
+            {"error": "before_id and after_id are mutually exclusive"}
+        ), 400
 
     try:
         # First check if the research exists
@@ -1892,54 +1912,52 @@ def get_research_logs(research_id):
             if not research:
                 return _research_not_found(research_id)
 
-            # Get logs from research_logs table
+            # Get logs from research_logs table. This is now structurally
+            # identical to the priority-free /logs/all endpoint: no
+            # ``case`` priority ordering, no diagnostic window — the
+            # live panel handles warning/error routing client-side.
             log_query = db_session.query(ResearchLog).filter_by(
                 research_id=research_id
             )
+            # Cursor pagination: WHERE id < before_id filters BEFORE the
+            # LIMIT so the SQL scan hits the index on ResearchLog.id,
+            # not the timestamp range. ``after_id`` is the symmetric
+            # forward cursor for the non-live log panel's "Load newer"
+            # button. Both paths use index seeks, so paging through a
+            # 50k-row research stays cheap regardless of how far the user
+            # has scrolled.
+            if before_id is not None:
+                log_query = log_query.filter(ResearchLog.id < before_id)
+            elif after_id is not None:
+                log_query = log_query.filter(ResearchLog.id > after_id)
             if limit is None:
                 log_results = log_query.order_by(
                     ResearchLog.timestamp, ResearchLog.id
                 ).all()
-            elif prioritize_diagnostics:
-                normalized_level = func.lower(ResearchLog.level)
-                diagnostic_priority = case(
-                    (
-                        normalized_level.in_(("error", "critical", "fatal")),
-                        0,
-                    ),
-                    (normalized_level == "warning", 1),
-                    (
-                        normalized_level.in_(("milestone", "success")),
-                        2,
-                    ),
-                    else_=3,
-                )
-                log_results = (
-                    log_query.order_by(
-                        diagnostic_priority,
-                        ResearchLog.timestamp.desc(),
-                        ResearchLog.id.desc(),
-                    )
-                    .limit(limit)
-                    .all()
-                )
-                log_results.sort(key=lambda row: (row.timestamp, row.id))
             else:
                 # Take the newest ``limit`` rows at the SQL layer, then flip
                 # back to oldest-first so the response ordering is unchanged.
                 # ``id`` is the tie-break: timestamps are not unique, so without
                 # it the rows that survive ``.limit()`` at a shared-timestamp
-                # boundary would be SQL-undefined.
-                log_results = list(
-                    reversed(
+                # boundary would be SQL-undefined. ``before_id`` / ``after_id``
+                # (set above) constrain the candidate set; ``after_id``
+                # sorts ASC inside the ``limit`` slice so the post-
+                # ``.all()`` list is already oldest-first — no reversal.
+                if after_id is not None:
+                    log_results = (
                         log_query.order_by(
-                            ResearchLog.timestamp.desc(),
-                            ResearchLog.id.desc(),
+                            ResearchLog.timestamp.asc(),
+                            ResearchLog.id.asc(),
                         )
                         .limit(limit)
                         .all()
                     )
-                )
+                else:
+                    raw_query = log_query.order_by(
+                        ResearchLog.timestamp.desc(),
+                        ResearchLog.id.desc(),
+                    ).limit(limit)
+                    log_results = list(reversed(raw_query.all()))
 
             # Extract log attributes while session is active
             # to avoid DetachedInstanceError on ORM attribute access
@@ -1961,11 +1979,214 @@ def get_research_logs(research_id):
         return jsonify({"error": "An internal error has occurred"}), 500
 
 
+@research_bp.route("/api/research/<string:research_id>/logs/warnings-errors")
+@login_required
+def get_research_logs_warnings_errors(research_id):
+    """Get ALL warning and error rows for a research, oldest-first.
+
+    Sibling endpoint of ``/logs`` used by the live log panel. The main
+    /logs response includes info / milestone rows (paginated) but
+    excludes diagnostics — those are too important to be paginated
+    out of the live window. This endpoint is the dedicated feed for
+    the warnings/errors tab: it returns every warning, error, critical,
+    and fatal row the server has, newest-first sorted by id (id is the
+    tie-break for same-timestamp rows).
+
+    The endpoint deliberately has no ``?limit`` — a long-running research
+    can produce thousands of warnings and errors, and the user's contract
+    is "show them all". If that ever becomes a bottleneck the right
+    answer is pagination on this endpoint, not truncation here. The
+    client replaces its warnings/errors tab contents with this response
+    wholesale on every fetch.
+    """
+    username = session["username"]
+
+    try:
+        with get_user_db_session(username) as db_session:
+            research = (
+                db_session.query(ResearchHistory)
+                .filter_by(id=research_id)
+                .first()
+            )
+            if not research:
+                return _research_not_found(research_id)
+
+            normalized_level = func.lower(ResearchLog.level)
+            log_results = (
+                db_session.query(ResearchLog)
+                .filter(ResearchLog.research_id == research_id)
+                .filter(
+                    normalized_level.in_(
+                        ("warning", "error", "critical", "fatal")
+                    )
+                )
+                .order_by(ResearchLog.id.asc())
+                .all()
+            )
+
+            logs = []
+            for row in log_results:
+                logs.append(
+                    {
+                        "id": row.id,
+                        "message": row.message,
+                        "timestamp": row.timestamp,
+                        "log_type": row.level,
+                    }
+                )
+
+        return jsonify(logs)
+
+    except Exception:
+        logger.exception("Error getting research warnings/errors")
+        return jsonify({"error": "An internal error has occurred"}), 500
+
+
+@research_bp.route("/api/research/<string:research_id>/logs/all")
+@login_required
+def get_research_logs_all(research_id):
+    """Get logs for a specific research without any priority biasing.
+
+    This is the priority-free sibling of ``get_research_logs``. It exists so
+    the frontend log panel can route its live (running) and non-live
+    (completed-research) requests to distinct endpoints rather than relying
+    on a ``?priority=diagnostic`` toggle on a single route:
+
+      * **Live** (progress page, chat with an active research) prefers the
+        biased window at ``/api/research/<id>/logs`` so errors / warnings /
+        milestones surface above routine noise — see
+        ``get_research_logs`` for the rationale on the selection query.
+      * **Non-live** (results page, after a completed research) prefers this
+        endpoint because the research is done and the user wants the actual
+        newest N rows plain, not a triage list that hides routine entries
+        between the diagnostics.
+
+    Both endpoints share the same query parameters and wire shape so the
+    client can swap between them with no other change:
+
+      * ``?limit=N`` — bounds the response; clamped to
+        ``[1, HISTORY_LOGS_HARD_CAP]``. Unset means "no limit".
+      * ``?before_id=X`` — return rows whose primary key is strictly less
+        than ``X``. Symmetric cursor for backward pagination; stable under
+        live inserts (new rows have higher IDs and don't shift it).
+      * ``?after_id=Y`` — return rows whose primary key is strictly greater
+        than ``Y``. Symmetric cursor for forward pagination.
+        ``before_id`` and ``after_id`` are mutually exclusive (400 on
+        conflict) for the same SQL planner reason as
+        ``get_research_logs``.
+
+    Sort order is always ``(timestamp ASC, id ASC)`` after the SQL-side
+    newest-N selection so the response is oldest-first within the
+    requested window — matching the wire shape the frontend already
+    consumes.
+
+    ``jsonify`` serializes each ``timestamp`` datetime using Flask's RFC 822
+    HTTP-date representation (matching ``/api/research/<id>/logs``).
+    Callers consuming both endpoints should not assume the timestamp wire
+    formats differ between the two.
+    """
+    username = session["username"]
+
+    limit = request.args.get("limit", type=int)
+    if limit is not None:
+        limit = max(1, min(limit, HISTORY_LOGS_HARD_CAP))
+    before_id = request.args.get("before_id", type=int)
+    if before_id is not None and before_id <= 0:
+        before_id = None
+    after_id = request.args.get("after_id", type=int)
+    if after_id is not None and after_id <= 0:
+        after_id = None
+    if before_id is not None and after_id is not None:
+        return jsonify(
+            {"error": "before_id and after_id are mutually exclusive"}
+        ), 400
+
+    try:
+        with get_user_db_session(username) as db_session:
+            research = (
+                db_session.query(ResearchHistory)
+                .filter_by(id=research_id)
+                .first()
+            )
+            if not research:
+                return _research_not_found(research_id)
+
+            log_query = db_session.query(ResearchLog).filter_by(
+                research_id=research_id
+            )
+            if before_id is not None:
+                log_query = log_query.filter(ResearchLog.id < before_id)
+            elif after_id is not None:
+                log_query = log_query.filter(ResearchLog.id > after_id)
+
+            # Plain newest-N window (no priority biasing). When
+            # ``?limit`` is absent, the historical contract is preserved
+            # and every row matching the cursor is returned so direct API
+            # callers see the full slice.
+            if limit is None:
+                log_results = log_query.order_by(
+                    ResearchLog.timestamp, ResearchLog.id
+                ).all()
+            else:
+                # Plain newest-N window (no priority biasing). When
+                # ``?limit`` is absent, the historical contract is preserved
+                # and every row matching the cursor is returned so direct API
+                # callers see the full slice.
+                # Take the newest ``limit`` rows from the SQL layer, then
+                # flip back to oldest-first so the response ordering is
+                # unchanged. ``id`` is the tie-break — timestamps are not
+                # unique, so without it the rows surviving ``.limit()`` at
+                # a shared-timestamp boundary would be SQL-undefined.
+                #
+                # ``after_id`` flips the order-by to ASC inside the
+                # ``limit`` slice (so the cursor lands on the row JUST
+                # newer than the prior slice) and skips the post-reversal
+                # step — the rows already come out oldest-first.
+                if after_id is not None:
+                    log_results = (
+                        log_query.order_by(
+                            ResearchLog.timestamp.asc(),
+                            ResearchLog.id.asc(),
+                        )
+                        .limit(limit)
+                        .all()
+                    )
+                else:
+                    raw_query = log_query.order_by(
+                        ResearchLog.timestamp.desc(),
+                        ResearchLog.id.desc(),
+                    ).limit(limit)
+                    log_results = list(reversed(raw_query.all()))
+
+            logs = []
+            for row in log_results:
+                logs.append(
+                    {
+                        "id": row.id,
+                        "message": row.message,
+                        "timestamp": row.timestamp,
+                        "log_type": row.level,
+                    }
+                )
+
+        return jsonify(logs)
+
+    except Exception:
+        logger.exception("Error getting research logs (no priority)")
+        return jsonify({"error": "An internal error has occurred"}), 500
+
+
 def _is_log_export_rate_limit_exempt():
     """Keep HEAD pre-flights outside the GET export quota."""
     return request.method == "HEAD" or _is_api_rate_limit_exempt()
 
 
+# NB: this used to live directly above the @research_bp.route decorator
+# pair, but ``get_research_logs_all`` sits between it and ``export_research_logs``
+# in this revision. The original layout accidentally left a dangling
+# decorator pointing at ``_log_export_limit = limiter.shared_limit(...)``
+# which made the module unparseable; consolidate so the assignment is
+# paired with the route it decorates.
 _log_export_limit = limiter.shared_limit(
     "10 per minute",
     scope="log_export",

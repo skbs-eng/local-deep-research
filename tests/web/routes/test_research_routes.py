@@ -1,6 +1,7 @@
 # allow: no-sut-import — black-box HTTP test; drives real routes through the Flask test client
 """Tests for research_routes module - Research page and API endpoints."""
 
+from datetime import timedelta
 from unittest.mock import patch, MagicMock
 
 
@@ -492,6 +493,20 @@ class TestGetResearchLogsApi:
                 f"{RESEARCH_PREFIX}/api/research/test-rid/logs{query}"
             )
 
+    def _get_logs_all(self, authenticated_client, session, query):
+        """Hit the priority-free ``/api/research/<id>/logs/all`` endpoint.
+
+        Used to verify the non-live log panel route: same pagination as
+        ``/api/research/<id>/logs`` but with no diagnostic triage and no
+        priority branch in the SQL.
+        """
+        with patch(f"{_RR}.get_user_db_session") as mock_db:
+            mock_db.return_value.__enter__ = lambda s: session
+            mock_db.return_value.__exit__ = MagicMock(return_value=False)
+            return authenticated_client.get(
+                f"{RESEARCH_PREFIX}/api/research/test-rid/logs/all{query}"
+            )
+
     def test_no_limit_returns_all_logs_oldest_first(self, authenticated_client):
         """Omitting ?limit preserves the public contract: every row, asc."""
         session = self._seed_real_session(10)
@@ -511,124 +526,6 @@ class TestGetResearchLogsApi:
             assert resp.status_code == 200, resp.status_code
             messages = [r["message"] for r in resp.get_json()]
             assert messages == ["Log 7", "Log 8", "Log 9"]
-        finally:
-            self._close_session(session)
-
-    def test_diagnostic_priority_preserves_old_warnings_and_errors(
-        self, authenticated_client
-    ):
-        """The log-panel window keeps diagnostics even when they predate the
-        newest routine rows, then returns the selected rows oldest-first."""
-        from local_deep_research.database.models import ResearchLog
-
-        session = self._seed_real_session(10)
-        try:
-            rows = session.query(ResearchLog).order_by(ResearchLog.id).all()
-            rows[0].level = "WARNING"
-            rows[1].level = "ERROR"
-            session.commit()
-
-            resp = self._get_logs(
-                authenticated_client,
-                session,
-                "?limit=4&priority=diagnostic",
-            )
-
-            assert resp.status_code == 200, resp.status_code
-            messages = [r["message"] for r in resp.get_json()]
-            assert messages == ["Log 0", "Log 1", "Log 8", "Log 9"]
-        finally:
-            self._close_session(session)
-
-    def test_diagnostic_priority_milestones(self, authenticated_client):
-        """Verifies that milestone logs are prioritized above routine logs."""
-        from local_deep_research.database.models import ResearchLog
-
-        session = self._seed_real_session(10)
-        try:
-            rows = session.query(ResearchLog).order_by(ResearchLog.id).all()
-            rows[0].level = "MILESTONE"
-            session.commit()
-
-            resp = self._get_logs(
-                authenticated_client,
-                session,
-                "?limit=3&priority=diagnostic",
-            )
-
-            assert resp.status_code == 200, resp.status_code
-            messages = [r["message"] for r in resp.get_json()]
-            assert messages == ["Log 0", "Log 8", "Log 9"]
-        finally:
-            self._close_session(session)
-
-    def test_diagnostic_priority_loguru_tiers(self, authenticated_client):
-        """Loguru aliases share the frontend's diagnostic priority tiers."""
-        from local_deep_research.database.models import ResearchLog
-
-        session = self._seed_real_session(10)
-        try:
-            rows = session.query(ResearchLog).order_by(ResearchLog.id).all()
-            rows[0].level = "CRITICAL"
-            rows[1].level = "FATAL"
-            rows[2].level = "ERROR"
-            rows[3].level = "CRITICAL"
-            rows[4].level = "WARNING"
-            rows[5].level = "SUCCESS"
-            rows[6].level = "MILESTONE"
-            session.commit()
-
-            overflow_resp = self._get_logs(
-                authenticated_client,
-                session,
-                "?limit=3&priority=diagnostic",
-            )
-            assert overflow_resp.status_code == 200, overflow_resp.status_code
-            assert [r["message"] for r in overflow_resp.get_json()] == [
-                "Log 1",
-                "Log 2",
-                "Log 3",
-            ]
-
-            all_tiers_resp = self._get_logs(
-                authenticated_client,
-                session,
-                "?limit=7&priority=diagnostic",
-            )
-            assert all_tiers_resp.status_code == 200, all_tiers_resp.status_code
-            assert [r["message"] for r in all_tiers_resp.get_json()] == [
-                f"Log {i}" for i in range(7)
-            ]
-        finally:
-            self._close_session(session)
-
-    def test_diagnostic_priority_overflow(self, authenticated_client):
-        """When a single tier (e.g. errors) alone exceeds limit, the oldest
-        errors and all other lower-priority categories are dropped."""
-        from local_deep_research.database.models import ResearchLog
-
-        session = self._seed_real_session(10)
-        try:
-            rows = session.query(ResearchLog).order_by(ResearchLog.id).all()
-            # Mark 5 errors
-            for i in range(5):
-                rows[i].level = "ERROR"
-            # Mark a warning that should get dropped because the limit is 3
-            rows[5].level = "WARNING"
-            session.commit()
-
-            resp = self._get_logs(
-                authenticated_client,
-                session,
-                "?limit=3&priority=diagnostic",
-            )
-
-            assert resp.status_code == 200, resp.status_code
-            messages = [r["message"] for r in resp.get_json()]
-            # Since errors are at the highest priority, and we have 5 errors,
-            # under limit=3, only the 3 newest errors (Log 2, Log 3, Log 4)
-            # are returned. The warning and routine logs are dropped.
-            assert messages == ["Log 2", "Log 3", "Log 4"]
         finally:
             self._close_session(session)
 
@@ -699,6 +596,483 @@ class TestGetResearchLogsApi:
             assert messages == ["Log 7", "Log 8", "Log 9"]
         finally:
             self._close_session(session)
+
+    # ------------------------------------------------------------------
+    # ?before_id= cursor pagination — the recommended way for the log
+    # panel to walk past HISTORY_LOGS_HARD_CAP. Stable under live inserts
+    # (new rows have higher ids and don't shift the cursor) and uses an
+    # index seek instead of a row-skip on the SQL side.
+    # ------------------------------------------------------------------
+
+    def test_before_id_zero_equivalent_to_default_limit(
+        self, authenticated_client
+    ):
+        """``?before_id=0`` is the newest window — same data as omitting
+        both ``before_id`` and ``offset``."""
+        session = self._seed_real_session(10)
+        try:
+            with_cursor = self._get_logs(
+                authenticated_client, session, "?limit=3&before_id=0"
+            )
+            without_cursor = self._get_logs(
+                authenticated_client, session, "?limit=3"
+            )
+            assert with_cursor.status_code == 200
+            assert without_cursor.status_code == 200
+            assert with_cursor.get_json() == without_cursor.get_json()
+        finally:
+            self._close_session(session)
+
+    def test_before_id_returns_strictly_older_rows(self, authenticated_client):
+        """``?limit=N&before_id=X`` returns the next N rows strictly
+        older than id X, oldest-first."""
+        session = self._seed_real_session(10)
+        try:
+            # The seeded rows have ids 1..10 (id = i + 1). Filter
+            # after the truth: a caller who has loaded rows 1..10
+            # and wants the next 500 (which don't exist) sends
+            # before_id=1. With the cursor parameterized by id, the
+            # response is rows with id < 1, which is [].
+            past = self._get_logs(
+                authenticated_client, session, "?limit=5&before_id=1"
+            )
+            assert past.get_json() == []
+            # Querying rows older than id=6 returns ids 1..5.
+            older = self._get_logs(
+                authenticated_client, session, "?limit=10&before_id=6"
+            )
+            assert [r["message"] for r in older.get_json()] == [
+                f"Log {i}" for i in range(5)
+            ]
+        finally:
+            self._close_session(session)
+
+    def test_before_id_walks_past_history_logs_hard_cap(
+        self, authenticated_client
+    ):
+        """Regression test for the "Load older" bug. With the hard cap
+        patched to 3, a 12-row research gives 4 pages of size 3. The
+        cursor-based pagination uses the oldest id of each page as the
+        next page's before_id, so the caller never asks for a row it's
+        already seen — no gap, no repeat, even if the server is
+        concurrently inserting new rows."""
+        session = self._seed_real_session(12)
+        try:
+            with patch(f"{_RR}.HISTORY_LOGS_HARD_CAP", 3):
+                # Rows have ids 1..12. Walk from the newest forward.
+                # Page 1: before_id=0 (i.e. omit) → newest 3 = ids 10,11,12.
+                page1 = self._get_logs(
+                    authenticated_client, session, "?limit=3&before_id=0"
+                )
+                cursor1 = page1.get_json()[0]["id"]
+                # Page 2: before_id=<oldest of page1> → next 3.
+                page2 = self._get_logs(
+                    authenticated_client,
+                    session,
+                    f"?limit=3&before_id={cursor1}",
+                )
+                cursor2 = page2.get_json()[0]["id"]
+                page3 = self._get_logs(
+                    authenticated_client,
+                    session,
+                    f"?limit=3&before_id={cursor2}",
+                )
+                cursor3 = page3.get_json()[0]["id"]
+                page4 = self._get_logs(
+                    authenticated_client,
+                    session,
+                    f"?limit=3&before_id={cursor3}",
+                )
+            assert [r["message"] for r in page1.get_json()] == [
+                "Log 9",
+                "Log 10",
+                "Log 11",
+            ]
+            assert [r["message"] for r in page2.get_json()] == [
+                "Log 6",
+                "Log 7",
+                "Log 8",
+            ]
+            assert [r["message"] for r in page3.get_json()] == [
+                "Log 3",
+                "Log 4",
+                "Log 5",
+            ]
+            assert [r["message"] for r in page4.get_json()] == [
+                "Log 0",
+                "Log 1",
+                "Log 2",
+            ]
+        finally:
+            self._close_session(session)
+
+    def test_before_id_stable_under_concurrent_inserts(
+        self, authenticated_client
+    ):
+        """The whole point of cursor pagination: rows that arrive after
+        the cursor is captured don't shift the boundary. With offset
+        they would; with before_id, the next page returns the same set
+        of rows the caller would have seen without the inserts."""
+        session = self._seed_real_session(10)
+        try:
+            # Page 1: ids 8, 9, 10 (messages Log 7, Log 8, Log 9).
+            page1 = self._get_logs(
+                authenticated_client, session, "?limit=3&before_id=0"
+            )
+            cursor1 = page1.get_json()[0]["id"]
+            # Simulate 5 rows being inserted between the two calls
+            # (e.g., a chat/research progress burst). With offset, the
+            # next page would shift by 5. With before_id, the cursor
+            # is still 8 and the response is the same: ids 5, 6, 7.
+            from local_deep_research.database.models import ResearchLog
+
+            base_time = session.query(ResearchLog).first().timestamp
+            for i in range(5):
+                session.add(
+                    ResearchLog(
+                        research_id="test-rid",
+                        timestamp=base_time.replace(microsecond=0)
+                        + timedelta(seconds=20 + i),
+                        message=f"New {i}",
+                        module="test",
+                        function="test",
+                        line_no=100 + i,
+                        level="INFO",
+                    )
+                )
+            session.commit()
+
+            page2 = self._get_logs(
+                authenticated_client,
+                session,
+                f"?limit=3&before_id={cursor1}",
+            )
+            # Same rows as if no inserts had happened: ids 5, 6, 7 (Log 4, 5, 6).
+            assert [r["message"] for r in page2.get_json()] == [
+                "Log 4",
+                "Log 5",
+                "Log 6",
+            ]
+        finally:
+            self._close_session(session)
+
+    def test_before_id_negative_clamps_to_zero(self, authenticated_client):
+        """Defensive: a negative ``before_id`` is treated as 0 = newest
+        window. The clamp sits at the SQL filter layer (the helper
+        turns it into ``id < 0``, which matches no rows, so we floor
+        to 0 instead)."""
+        session = self._seed_real_session(10)
+        try:
+            clamped = self._get_logs(
+                authenticated_client,
+                session,
+                "?limit=3&before_id=-1",
+            )
+            default = self._get_logs(authenticated_client, session, "?limit=3")
+            assert clamped.status_code == 200
+            assert clamped.get_json() == default.get_json()
+        finally:
+            self._close_session(session)
+
+    # ------------------------------------------------------------------
+    # ?after_id= cursor pagination — the symmetric forward cursor for
+    # the non-live log panel's "Load newer" button. Same id-stability
+    # guarantee as before_id (new rows have higher ids and don't shift
+    # the cursor) and uses an index seek instead of a row-skip.
+    # ------------------------------------------------------------------
+
+    def test_after_id_returns_strictly_newer_rows(self, authenticated_client):
+        """``?limit=N&after_id=X`` returns the next N rows strictly
+        newer than id X, oldest-first (so the response ordering is
+        contiguous with what the client already has)."""
+        session = self._seed_real_session(10)
+        try:
+            # Rows have ids 1..10. Querying rows newer than id=5
+            # returns ids 6..10, oldest-first.
+            newer = self._get_logs(
+                authenticated_client, session, "?limit=10&after_id=5"
+            )
+            assert [r["message"] for r in newer.get_json()] == [
+                f"Log {i}" for i in range(5, 10)
+            ]
+            # Querying rows newer than the max id returns [].
+            past_max = self._get_logs(
+                authenticated_client, session, "?limit=5&after_id=10"
+            )
+            assert past_max.get_json() == []
+        finally:
+            self._close_session(session)
+
+    def test_after_id_negative_clamps_to_zero(self, authenticated_client):
+        """Defensive: a negative ``after_id`` is treated as 0 — the
+        SQL filter becomes ``id > 0`` which matches every row, so a
+        negative value is equivalent to omitting the cursor."""
+        session = self._seed_real_session(10)
+        try:
+            clamped = self._get_logs(
+                authenticated_client,
+                session,
+                "?limit=5&after_id=-1",
+            )
+            default = self._get_logs(authenticated_client, session, "?limit=5")
+            assert clamped.status_code == 200
+            assert clamped.get_json() == default.get_json()
+        finally:
+            self._close_session(session)
+
+    def test_after_id_and_before_id_are_mutually_exclusive(
+        self, authenticated_client
+    ):
+        """The two cursors can't be combined — the SQL planner can't
+        combine two index seeks into a single ordered slice. Reject
+        with 400 so the client falls back to one cursor at a time."""
+        session = self._seed_real_session(10)
+        try:
+            response = self._get_logs(
+                authenticated_client,
+                session,
+                "?limit=5&before_id=5&after_id=5",
+            )
+            assert response.status_code == 400
+            assert "mutually exclusive" in response.get_json()["error"]
+        finally:
+            self._close_session(session)
+
+    def test_after_id_walks_forward_past_history_logs_hard_cap(
+        self, authenticated_client
+    ):
+        """Forward-walk through 12 rows of a paginated load using ``after_id``.
+
+        The hard cap is patched to 3 so each page carries exactly 3 rows.
+        ``after_id`` skips ids <= the cursor, so picking ``after_id=3``
+        first yields ids 4-6 (oldest window after the boundary), then
+        ``after_id=6`` yields 7-9, and ``after_id=9`` yields 10-12. Going
+        past the last id returns ``[]`` — the endpoint correctly empties
+        when the cursor is at the boundary.
+
+        Note: ``after_id=0`` would NOT yield ids 1-3 because the endpoint
+        coerces ``<= 0`` to ``None`` ("no cursor") and returns the newest
+        ``limit`` rows — see ``test_after_id_negative_clamps_to_zero``.
+        That's symmetrical to ``before_id=0`` returning the newest 3 in
+        ``test_before_id_walks_past_history_logs_hard_cap``."""
+        session = self._seed_real_session(12)
+        try:
+            with patch(f"{_RR}.HISTORY_LOGS_HARD_CAP", 3):
+                # Rows have ids 1..12. Walk forward — first page starts
+                # strictly past id 3 to land on ids 4, 5, 6.
+                # Page 1: after_id=3 → ids 4,5,6 (Log 3,4,5).
+                page1 = self._get_logs(
+                    authenticated_client, session, "?limit=3&after_id=3"
+                )
+                page1_data = page1.get_json()
+                assert [r["message"] for r in page1_data] == [
+                    "Log 3",
+                    "Log 4",
+                    "Log 5",
+                ], f"page1 unexpected: {page1_data}"
+                # The newest id in page1 becomes the next cursor.
+                cursor1 = page1_data[-1]["id"]
+                assert cursor1 == 6
+
+                page2 = self._get_logs(
+                    authenticated_client,
+                    session,
+                    f"?limit=3&after_id={cursor1}",
+                )
+                page2_data = page2.get_json()
+                assert [r["message"] for r in page2_data] == [
+                    "Log 6",
+                    "Log 7",
+                    "Log 8",
+                ], f"page2 unexpected: {page2_data}"
+                cursor2 = page2_data[-1]["id"]
+                assert cursor2 == 9
+
+                page3 = self._get_logs(
+                    authenticated_client,
+                    session,
+                    f"?limit=3&after_id={cursor2}",
+                )
+                page3_data = page3.get_json()
+                assert [r["message"] for r in page3_data] == [
+                    "Log 9",
+                    "Log 10",
+                    "Log 11",
+                ], f"page3 unexpected: {page3_data}"
+
+                # One step further past the last id returns an empty
+                # batch — the cursor-based pagination contract, ready
+                # for the frontend to pin ``newestLoadedId`` and hide
+                # the Load newer button.
+                cursor3 = page3_data[-1]["id"]
+                page4 = self._get_logs(
+                    authenticated_client,
+                    session,
+                    f"?limit=3&after_id={cursor3}",
+                )
+                assert page4.get_json() == []
+        finally:
+            self._close_session(session)
+
+
+class TestGetResearchLogsAllApi:
+    """Tests for the priority-free ``/api/research/<id>/logs/all`` endpoint.
+
+    This endpoint exists so the non-live (completed-research) log panel
+    can fetch its rows without going through the ``?priority=diagnostic``
+    triage logic that lives on the original ``/api/research/<id>/logs``
+    endpoint. Live (running) panels keep using the priority endpoint;
+    only results-page / chat-with-completed-research panels use this one.
+
+    The wire shape is identical to ``get_research_logs`` (a top-level JSON
+    array of ``{id, message, timestamp, log_type}``), so a caller can
+    swap between the two without other changes.
+    """
+
+    def test_requires_authentication(self, client):
+        """Should require authentication, like the priority endpoint."""
+        response = client.get(
+            f"{RESEARCH_PREFIX}/api/research/test-id/logs/all"
+        )
+        # The Flask-Login wrapper returns 401 for unauthenticated API
+        # requests (matches the priority endpoint's contract; we just
+        # assert that auth is required, not the specific code).
+        assert response.status_code in (302, 401), response.status_code
+
+    def test_no_limit_returns_all_logs_oldest_first(self, authenticated_client):
+        """The plain endpoint returns every row, oldest-first, with no triage."""
+        session = TestGetResearchLogsApi._seed_real_session(10)
+        try:
+            with patch(f"{_RR}.get_user_db_session") as mock_db:
+                mock_db.return_value.__enter__ = lambda s: session
+                mock_db.return_value.__exit__ = MagicMock(return_value=False)
+                response = authenticated_client.get(
+                    f"{RESEARCH_PREFIX}/api/research/test-rid/logs/all"
+                )
+            assert response.status_code == 200, response.status_code
+            messages = [r["message"] for r in response.get_json()]
+            assert messages == [f"Log {i}" for i in range(10)]
+        finally:
+            TestGetResearchLogsApi._close_session(session)
+
+    def test_limit_returns_newest_n_oldest_first(self, authenticated_client):
+        """?limit=N takes the newest N rows without any diagnostic prioritization."""
+        session = TestGetResearchLogsApi._seed_real_session(10)
+        try:
+            with patch(f"{_RR}.get_user_db_session") as mock_db:
+                mock_db.return_value.__enter__ = lambda s: session
+                mock_db.return_value.__exit__ = MagicMock(return_value=False)
+                response = authenticated_client.get(
+                    f"{RESEARCH_PREFIX}/api/research/test-rid/logs/all?limit=3"
+                )
+            assert response.status_code == 200, response.status_code
+            messages = [r["message"] for r in response.get_json()]
+            assert messages == ["Log 7", "Log 8", "Log 9"]
+        finally:
+            TestGetResearchLogsApi._close_session(session)
+
+    def test_diagnostic_levels_do_not_bias_result_order(
+        self, authenticated_client
+    ):
+        """The priority-free endpoint ignores WARNING / ERROR rows when
+        picking the window — the panel for a completed research should
+        see actual newest rows plain, not a triage list. This is the
+        endpoint's whole reason to exist.
+        """
+        from local_deep_research.database.models import ResearchLog
+
+        session = TestGetResearchLogsApi._seed_real_session(10)
+        try:
+            rows = session.query(ResearchLog).order_by(ResearchLog.id).all()
+            # Promote the oldest two rows to WARNING/ERROR. On the
+            # priority endpoint these would be surfaced into the
+            # 3-row window; on the priority-free endpoint they stay
+            # out because they're older than ``limit=2`` newest rows.
+            rows[0].level = "WARNING"
+            rows[1].level = "ERROR"
+            session.commit()
+
+            with patch(f"{_RR}.get_user_db_session") as mock_db:
+                mock_db.return_value.__enter__ = lambda s: session
+                mock_db.return_value.__exit__ = MagicMock(return_value=False)
+                response = authenticated_client.get(
+                    f"{RESEARCH_PREFIX}/api/research/test-rid/logs/all?limit=2"
+                )
+            assert response.status_code == 200, response.status_code
+            messages = [r["message"] for r in response.get_json()]
+            # The two newest (newest ids 10, 9) come back; the
+            # diagnostics at ids 1, 2 are NOT promoted into the window
+            # the way they would be on the priority endpoint.
+            assert messages == ["Log 8", "Log 9"]
+        finally:
+            TestGetResearchLogsApi._close_session(session)
+
+    def test_before_id_returns_strictly_older_rows(self, authenticated_client):
+        """Symmetric cursor contract on the priority-free endpoint."""
+        session = TestGetResearchLogsApi._seed_real_session(10)
+        try:
+            with patch(f"{_RR}.get_user_db_session") as mock_db:
+                mock_db.return_value.__enter__ = lambda s: session
+                mock_db.return_value.__exit__ = MagicMock(return_value=False)
+                response = authenticated_client.get(
+                    f"{RESEARCH_PREFIX}/api/research/test-rid/logs/all?before_id=5"
+                )
+            assert response.status_code == 200, response.status_code
+            messages = [r["message"] for r in response.get_json()]
+            assert messages == ["Log 0", "Log 1", "Log 2", "Log 3"]
+        finally:
+            TestGetResearchLogsApi._close_session(session)
+
+    def test_after_id_returns_strictly_newer_rows(self, authenticated_client):
+        """Symmetric forward cursor on the priority-free endpoint."""
+        session = TestGetResearchLogsApi._seed_real_session(10)
+        try:
+            with patch(f"{_RR}.get_user_db_session") as mock_db:
+                mock_db.return_value.__enter__ = lambda s: session
+                mock_db.return_value.__exit__ = MagicMock(return_value=False)
+                response = authenticated_client.get(
+                    f"{RESEARCH_PREFIX}/api/research/test-rid/logs/all?after_id=7"
+                )
+            assert response.status_code == 200, response.status_code
+            messages = [r["message"] for r in response.get_json()]
+            # Rows have ids 1..10 (Log 0..Log 9). after_id=7 returns
+            # rows where id > 7 — ids 8, 9, 10 → messages Log 7, 8, 9.
+            assert messages == ["Log 7", "Log 8", "Log 9"]
+        finally:
+            TestGetResearchLogsApi._close_session(session)
+
+    def test_before_id_and_after_id_are_mutually_exclusive(
+        self, authenticated_client
+    ):
+        """Sending both cursors must return 400 — same planner
+        limitation that applies to the priority endpoint."""
+        session = TestGetResearchLogsApi._seed_real_session(10)
+        try:
+            with patch(f"{_RR}.get_user_db_session") as mock_db:
+                mock_db.return_value.__enter__ = lambda s: session
+                mock_db.return_value.__exit__ = MagicMock(return_value=False)
+                response = authenticated_client.get(
+                    f"{RESEARCH_PREFIX}/api/research/test-rid/logs/all"
+                    "?before_id=5&after_id=7"
+                )
+            assert response.status_code == 400, response.status_code
+            payload = response.get_json()
+            assert "error" in payload
+            assert "before_id and after_id" in payload["error"]
+        finally:
+            TestGetResearchLogsApi._close_session(session)
+
+    def test_404_for_missing_research(self, authenticated_client):
+        """Same 404 contract as the priority endpoint."""
+        with patch(f"{_RR}.get_user_db_session") as mock_db:
+            mock_session = MagicMock()
+            mock_session.query.return_value.filter_by.return_value.first.return_value = None
+            mock_db.return_value.__enter__ = lambda s: mock_session
+            mock_db.return_value.__exit__ = MagicMock(return_value=False)
+            response = authenticated_client.get(
+                f"{RESEARCH_PREFIX}/api/research/missing-rid/logs/all"
+            )
+        assert response.status_code == 404, response.status_code
 
 
 class TestExportResearchLogsApi:

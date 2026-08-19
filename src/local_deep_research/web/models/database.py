@@ -130,7 +130,11 @@ def calculate_duration(created_at_str, completed_at_str=None):
     return None
 
 
-def get_logs_for_research(research_id, limit: int | None = None):
+def get_logs_for_research(
+    research_id,
+    limit: int | None = None,
+    before_id: int | None = None,
+):
     """
     Retrieve logs for a specific research ID, oldest-first.
 
@@ -141,6 +145,14 @@ def get_logs_for_research(research_id, limit: int | None = None):
             response size of ``/history/logs/<id>`` — long langgraph
             researches can produce thousands of 10 KB rows that the
             frontend prunes to 500 anyway.
+        before_id: Cursor pagination — return only rows whose primary
+            key is strictly less than ``before_id``. This is the
+            recommended way to page through the log panel: the caller
+            hands back the oldest ID it has, and the server returns
+            the next batch without re-scanning rows already shipped.
+            Stable under live inserts (new rows have higher IDs and
+            don't shift the cursor) and uses an index seek instead of a
+            row-skip on the SQL side.
 
     Returns:
         List of log entries as dictionaries
@@ -150,13 +162,15 @@ def get_logs_for_research(research_id, limit: int | None = None):
             query = session.query(ResearchLog).filter(
                 ResearchLog.research_id == research_id
             )
+            if before_id is not None and int(before_id) > 0:
+                query = query.filter(ResearchLog.id < int(before_id))
             if limit is not None:
                 # Take the newest ``limit`` rows from the DB, then flip back
                 # to oldest-first ordering for the caller. Avoids loading
-                # the entire table when only the tail is wanted. ``id`` is the
-                # tie-break: timestamps are not unique, so without it the rows
-                # surviving ``.limit()`` at a shared-timestamp boundary would
-                # be SQL-undefined.
+                # the entire table when only the tail is wanted. ``id`` is
+                # the tie-break: timestamps are not unique, so without it
+                # the rows surviving ``.limit()`` at a shared-timestamp
+                # boundary would be SQL-undefined.
                 log_results = list(
                     reversed(
                         query.order_by(

@@ -762,6 +762,42 @@ class TestGetResearchLogs:
                 assert response.status_code == 200
                 assert mock_logs.call_args.kwargs.get("limit") == 1
 
+    # ------------------------------------------------------------------
+    # ?before_id= cursor pagination — the only pagination cursor the
+    # endpoint supports. ?offset= was removed; see logpanel cursor
+    # rewrite. ``get_logs_for_research`` applies ``WHERE id < X`` before
+    # the LIMIT, so the SQL is an index seek rather than a row-skip.
+    # ------------------------------------------------------------------
+
+    def test_before_id_is_forwarded_to_helper(self, authenticated_client):
+        """``?before_id=N`` is forwarded to ``get_logs_for_research`` so the
+        helper can run its own SQL pagination."""
+        with self._patch_existing_research():
+            with patch(
+                "local_deep_research.web.routes.history_routes.get_logs_for_research"
+            ) as mock_logs:
+                mock_logs.return_value = []
+                response = authenticated_client.get(
+                    f"{HISTORY_PREFIX}/logs/test-id?limit=100&before_id=500"
+                )
+                assert response.status_code == 200
+                assert mock_logs.call_args.kwargs.get("before_id") == 500
+
+    def test_negative_before_id_is_forwarded(self, authenticated_client):
+        """The cursor is forwarded raw — the helper's ``id < X`` filter
+        is the boundary that clamps. We just verify the value is
+        passed through for the helper to handle."""
+        with self._patch_existing_research():
+            with patch(
+                "local_deep_research.web.routes.history_routes.get_logs_for_research"
+            ) as mock_logs:
+                mock_logs.return_value = []
+                response = authenticated_client.get(
+                    f"{HISTORY_PREFIX}/logs/test-id?limit=100&before_id=-1"
+                )
+                assert response.status_code == 200
+                assert mock_logs.call_args.kwargs.get("before_id") == -1
+
 
 class TestGetLogCount:
     """Tests for /history/log_count/<research_id> endpoint."""

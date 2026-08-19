@@ -14,6 +14,8 @@ if (typeof URLS !== 'undefined') {
         RESEARCH_STATUS: '/api/research/{id}/status',
         RESEARCH_DETAILS: '/api/research/{id}',
         RESEARCH_LOGS: '/api/research/{id}/logs',
+        RESEARCH_LOGS_WARNINGS_ERRORS: '/api/research/{id}/logs/warnings-errors',
+        RESEARCH_LOGS_ALL: '/api/research/{id}/logs/all',
         RESEARCH_LOGS_EXPORT: '/api/research/{id}/logs/export',
         RESEARCH_REPORT: '/api/report/{id}',
         TERMINATE_RESEARCH: '/api/terminate/{id}',
@@ -191,6 +193,31 @@ const URLBuilder = {
 
     researchLogs(researchId, limit) {
         const base = this.build(URLS.API.RESEARCH_LOGS, researchId);
+        if (limit === undefined || limit === null) return base;
+        return `${base}?limit=${encodeURIComponent(limit)}`;
+    },
+
+    /**
+     * Dedicated feed for warning/error rows used by the live log
+     * panel's diagnostics tab. Returns every warning, error, critical,
+     * and fatal row the server has, oldest-first by id — no limit, no
+     * pagination. The client wholesale-replaces its warnings/errors
+     * tab contents with this response on every fetch.
+     */
+    researchLogsWarningsErrors(researchId) {
+        return this.build(URLS.API.RESEARCH_LOGS_WARNINGS_ERRORS, researchId);
+    },
+
+    /**
+     * Priority-free sibling of researchLogs. Routes the log panel to
+     * the unfiltered ``/api/research/<id>/logs/all`` endpoint when the
+     * bound research is no longer running (the results page, after a
+     * completed research). Structurally identical to the live
+     * ``/logs`` endpoint (both are now priority-free); the live vs.
+     * non-live split is purely a frontend routing decision.
+     */
+    researchLogsAll(researchId, limit) {
+        const base = this.build(URLS.API.RESEARCH_LOGS_ALL, researchId);
         if (limit === undefined || limit === null) return base;
         return `${base}?limit=${encodeURIComponent(limit)}`;
     },

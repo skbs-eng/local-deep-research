@@ -59,3 +59,24 @@ import '@js/components/semantic_search.js';
 // assertions on safeFetch.mock.calls valid (the call still reaches safeFetch).
 // A test that needs to exercise the 401-redirect path overrides this global.
 globalThis.safeFetchWithAuth = (...args) => globalThis.safeFetch(...args);
+
+// ─── async-flush helper for happy-dom tests ────────────────────────────
+//
+// happy-dom's resolved-Promise mocks still schedule work through microtasks,
+// so a click handler that fires `loadLogs()` (an async function) needs the
+// microtask queue drained before subsequent assertions can observe the
+// resulting DOM updates. `await new Promise(r => setTimeout(r, N))` worked
+// in past revisions — at the cost of 50-100ms of real-time delay per
+// wait site — but the user explicitly asked us to stop relying on
+// real-time waits.
+//
+// Measure: in the logpanel suite, a complete `loadLogs(researchId,
+// limit)` chain (count fetch → logs fetch → parse → append → render)
+// commits within four microtask flushes. We pick 8 to leave headroom
+// for any chain the next refactor might add — still sub-microsecond
+// per wait site, vs. tens of milliseconds for the old setTimeout.
+globalThis.flushMicrotasks = async (rounds = 8) => {
+    for (let i = 0; i < rounds; i++) {
+        await Promise.resolve();
+    }
+};

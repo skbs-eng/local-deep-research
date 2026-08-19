@@ -407,6 +407,11 @@ def get_research_logs(research_id):
     load (a long langgraph run can persist thousands of rows; pre-cap
     the route allocated ~150 MB transient on the server and Firefox
     parsed a ~50 MB JSON response).
+
+    ``?before_id=X`` returns rows whose primary key is strictly less
+    than ``X`` — the recommended cursor for the log panel: stable under
+    live inserts (new rows have higher IDs and don't shift the cursor)
+    and uses an index seek instead of a row-skip on the SQL side.
     """
     username = session["username"]
 
@@ -414,6 +419,9 @@ def get_research_logs(research_id):
         "limit", default=HISTORY_LOGS_DEFAULT_LIMIT, type=int
     )
     limit = max(1, min(limit, HISTORY_LOGS_HARD_CAP))
+    before_id = request.args.get("before_id", type=int)
+    if before_id is not None and before_id <= 0:
+        before_id = None
 
     # First check if the research exists
     with get_user_db_session(username) as db_session:
@@ -424,7 +432,7 @@ def get_research_logs(research_id):
         if not research:
             return _research_not_found(research_id)
 
-    logs = get_logs_for_research(research_id, limit=limit)
+    logs = get_logs_for_research(research_id, limit=limit, before_id=before_id)
 
     # Defensive backfill for any row missing the three frontend-required
     # fields. `get_logs_for_research` always sets these from ResearchLog

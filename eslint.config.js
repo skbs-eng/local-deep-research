@@ -419,6 +419,11 @@ export default [
         // Page-defined functions referenced from page.evaluate() with a
         // `typeof X === 'function'` guard
         handleTestRun: "readonly",
+        // Helper installed in tests/js/setup.js: drains the microtask queue
+        // so click handlers' async work (loadLogs, appendBatch) commits
+        // before subsequent assertions. Used by every logpanel test that
+        // dispatches clicks via dispatchEvent.
+        flushMicrotasks: "readonly",
       },
     },
   },

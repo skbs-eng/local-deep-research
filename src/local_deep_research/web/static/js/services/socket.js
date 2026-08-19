@@ -369,7 +369,15 @@ window.socket = (function() {
                         // Send to log panel
                         if (typeof window.addConsoleLog === 'function') {
                             // Use the main console log function if available
-                            window.addConsoleLog(logItem.message, logType, logItem.metadata);
+                            window.addConsoleLog(
+                                logItem.message,
+                                logType,
+                                {
+                                    ...(logItem.metadata || {}),
+                                    time: logItem.time,
+                                    id: logItem.id,
+                                }
+                            );
                         } else if (typeof window._socketAddLogEntry === 'function') {
                             // Fallback to the direct connector if needed
                             const logEntry = {
@@ -427,7 +435,11 @@ window.socket = (function() {
                         data.log_entry.type ||
                         (data.log_entry.metadata && data.log_entry.metadata.type) ||
                         'info',
-                        data.log_entry.metadata
+                        {
+                            ...(data.log_entry.metadata || {}),
+                            time: data.log_entry.time,
+                            id: data.log_entry.id,
+                        }
                     );
                 } else if (typeof window._socketAddLogEntry === 'function') {
                     window._socketAddLogEntry(data.log_entry);
